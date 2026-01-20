@@ -1,0 +1,8 @@
+
+[server]
+maxUploadSize = 1000            # até 512 MB por arquivo (ajuste se precisar)
+
+[theme]
+base="light"
+primaryColor="#0F766E"
+font="sans serif"
