@@ -1,25 +1,54 @@
 
-# app.py — ROI PX Day (2 uploads, sem gráficos)
+# app.py — ROI PX Day (2 uploads, sem gráficos, com normalização e filtro de clientes)
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from io import BytesIO
+import unicodedata, re
 
 st.set_page_config(page_title="ROI PX Day — Relatório", page_icon="📊", layout="wide")
+
+# ==============================
+# Utilitários de normalização
+# ==============================
+SUFIXOS_EXCLUIR = [
+    r"LTDA", r"Ltda", r"S\.?A\.?", r"SA", r"S A", r"EIRELI", r"ME", r"MEI",
+    r"TRANSPORTES LTDA", r"TRANSPORTES", r"LOGISTICA", r"LOGÍSTICA",
+    r"COMERCIO", r"COMÉRCIO", r"INDUSTRIA", r"INDÚSTRIA", r"EIRELI - ME",
+    r"TRANSPORTADORA", r"OPERADOR[AE]? LOG[ÍI]STIC[OA]", r"OPERA(C|Ç)ÕES LOG[ÍI]STIC[OA]S?"
+]
+
+def strip_accents(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s))
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+def normalize_name(s: str) -> str:
+    s = strip_accents(s).upper().strip()
+    for suf in SUFIXOS_EXCLUIR:
+        s = re.sub(rf"\b{suf}\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"[^A-Z0-9/&.\- ]", " ", s)  # remove símbolos estranhos
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # padroniza formas frequentes
+    s = re.sub(r"\bS A\b", "SA", s)
+    s = re.sub(r"\bS\/A\b", "SA", s)
+    return s
 
 # ==============================
 # Funções utilitárias de leitura
 # ==============================
 def read_any_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Tenta ler um CSV com diferentes encodings/separadores.
+    """
     last_err = None
     for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         for sep in (";", ",", "\t", "|"):
             try:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=sep, encoding=enc, engine="python")
-                # heurística: descartar linhas totalmente vazias
-                if df.empty or all(col.startswith("Unnamed") for col in df.columns):
+                # ignora leituras claramente inválidas
+                if df.empty or all(str(c).startswith("Unnamed") for c in df.columns):
                     continue
                 return df
             except Exception as e:
@@ -32,17 +61,22 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
-    """Converte coluna MES para datetime (ignora hora) e cria AnoMes/Ano/MesNum."""
+    """
+    Converte coluna MES para datetime (ignora hora) e cria AnoMes/Ano/MesNum.
+    Aceita dd/mm/aaaa, yyyy-mm-dd, ISO com timezone, etc.
+    """
     out = df.copy()
-    # tenta dd/mm/aaaa, depois yyyy-mm-dd e parsing geral
+    # tentativas dirigidas
+    tried = False
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
         try:
             out[col] = pd.to_datetime(out[col], format=fmt, errors="raise")
+            tried = True
             break
         except Exception:
             pass
-    else:
-        out[col] = pd.to_datetime(out[col], errors="coerce")
+    if not tried:
+        out[col] = pd.to_datetime(out[col], errors="coerce")  # ISO, tz, etc.
     out[col] = out[col].dt.tz_localize(None)
     out["AnoMes"] = out[col].dt.strftime("%Y-%m")
     out["Ano"] = out[col].dt.year
@@ -50,6 +84,11 @@ def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
     return out
 
 def clean_num_series(s: pd.Series) -> pd.Series:
+    """
+    Limpa números no padrão PT-BR:
+    - remove separador de milhar (.)
+    - troca vírgula decimal (,) por ponto (.)
+    """
     s = s.astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
@@ -59,7 +98,7 @@ def trimestre_str(m: int) -> str:
 def media_trimestral_visita(agr_mes: pd.DataFrame, visit_month_str: str) -> tuple[float, str]:
     """
     Média dos DIAS DE CONTRATO no trimestre civil da visita.
-    Retorna (media, "Qx-YYYY"). Logica compatível com seu script.  # fonte: script original
+    Retorna (media, "Qx-YYYY").
     """
     if not visit_month_str:
         return np.nan, ""
@@ -68,7 +107,10 @@ def media_trimestral_visita(agr_mes: pd.DataFrame, visit_month_str: str) -> tupl
     except Exception:
         return np.nan, ""
     ano, m = visit_dt.year, visit_dt.month
-    meses_q = [1,2,3] if m in (1,2,3) else ([4,5,6] if m in (4,5,6) else ([7,8,9] if m in (7,8,9) else [10,11,12]))
+    if m in (1,2,3): meses_q = [1,2,3]
+    elif m in (4,5,6): meses_q = [4,5,6]
+    elif m in (7,8,9): meses_q = [7,8,9]
+    else: meses_q = [10,11,12]
     mask = (agr_mes["Ano"] == ano) & (agr_mes["MesNum"].isin(meses_q))
     vals = agr_mes.loc[mask, "DIAS DE CONTRATO"].astype(float)
     media = float(vals.mean()) if not vals.empty else np.nan
@@ -76,43 +118,46 @@ def media_trimestral_visita(agr_mes: pd.DataFrame, visit_month_str: str) -> tupl
 
 def detectar_colunas_visitas(dfv: pd.DataFrame) -> tuple[str, str]:
     cols = [c.lower() for c in dfv.columns]
-    # Nome do cliente
+    # nome
     if "cliente" in cols:
         col_cli = dfv.columns[cols.index("cliente")]
     elif "nome transportadora(s)" in cols:
         col_cli = dfv.columns[cols.index("nome transportadora(s)")]
     else:
-        col_cli = dfv.columns[0]  # primeira coluna
-    # Data da visita
+        col_cli = dfv.columns[0]
+    # data
     for cand in ("datavisita", "data visita", "visita", "data", "mesvisita", "mês da visita"):
         if cand in cols:
             col_dt = dfv.columns[cols.index(cand)]
             break
     else:
-        raise ValueError("A base de visitas precisa ter uma coluna com a data/mês da visita (ex.: 'DataVisita').")
+        raise ValueError("A base de visitas precisa ter uma coluna com a data/mês da visita (ex.: 'Data Visita').")
     return col_cli, col_dt
 
 def preparar_visitas(dfv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Padroniza a base de visitas, gera Cliente_norm (normalizado) e VisitMonth (YYYY-MM).
+    """
     dfv = normalize_cols(dfv)
     col_cli, col_dt = detectar_colunas_visitas(dfv)
     out = dfv[[col_cli, col_dt]].copy()
     out.columns = ["Cliente", "DataVisita"]
+
     # normaliza cliente
-    out["Cliente_norm"] = out["Cliente"].astype(str).str.strip().str.upper()
+    out["Cliente_norm"] = out["Cliente"].astype(str).map(normalize_name)
+
     # normaliza data -> AnoMes
-    # aceita "aaaa-mm", "mm/aaaa", data completa
     def to_ym(s):
         s = str(s).strip()
-        # formatos comuns
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%Y", "%Y-%m"):
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%Y", "%Y-%m", "%d-%m-%Y"):
             try:
                 dt = pd.to_datetime(s, format=fmt, errors="raise")
                 return dt.strftime("%Y-%m")
             except Exception:
                 pass
-        # fallback
         dt = pd.to_datetime(s, errors="coerce")
         return dt.strftime("%Y-%m") if pd.notna(dt) else None
+
     out["VisitMonth"] = out["DataVisita"].map(to_ym)
     out = out.dropna(subset=["VisitMonth"]).drop_duplicates(subset=["Cliente_norm"], keep="last")
     return out[["Cliente", "Cliente_norm", "VisitMonth"]]
@@ -120,7 +165,7 @@ def preparar_visitas(dfv: pd.DataFrame) -> pd.DataFrame:
 # =====================================
 # UI — uploads e parâmetros do relatório
 # =====================================
-st.title("ROI PX Day — Relatório sem gráficos")
+st.title("ROI PX Day — Relatório (sem gráficos)")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -136,7 +181,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         st.warning("Envie os dois arquivos CSV para continuar.")
         st.stop()
 
-    # Ler bases
+    # ---------- Ler bases ----------
     try:
         df = read_any_csv(comportamento_file)
         dfv = read_any_csv(visitas_file)
@@ -144,50 +189,59 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         st.error(f"Erro ao ler os arquivos: {e}")
         st.stop()
 
+    # ---------- Padronizar base mensal ----------
     try:
-        # Normalizações da base mensal — compatível com seu script original
         df = normalize_cols(df)
-        # tenta localizar campos chave
+
         # MES
         if "MES" not in df.columns:
-            # tenta variantes
-            for cand in ("MÊS", "mes", "data", "Data"):
+            for cand in ("MÊS", "mes", "data", "Data", "Mes"):
                 if cand in df.columns:
                     df = df.rename(columns={cand: "MES"})
                     break
+        if "MES" not in df.columns:
+            raise ValueError("Não encontrei a coluna de data do mês (ex.: 'MES').")
+
         # NOME TRANSPORTADORA(S)
         nome_col = None
         for c in df.columns:
-            if "transportadora" in c.lower() or "cliente" in c.lower() or "nome" in c.lower():
+            cl = c.lower()
+            if "transportadora" in cl or "cliente" in cl or "nome" in cl:
                 nome_col = c; break
         if nome_col is None:
             raise ValueError("Não encontrei a coluna de cliente (ex.: 'NOME TRANSPORTADORA(S)').")
         if nome_col != "NOME TRANSPORTADORA(S)":
             df = df.rename(columns={nome_col: "NOME TRANSPORTADORA(S)"})
+
         # DIAS DE CONTRATO
         dias_col = None
         for c in df.columns:
-            if "dias" in c.lower() and "contrato" in c.lower():
+            cl = c.lower()
+            if "dias" in cl and "contrato" in cl:
                 dias_col = c; break
         if dias_col is None:
             raise ValueError("Não encontrei a coluna 'DIAS DE CONTRATO'.")
         if dias_col != "DIAS DE CONTRATO":
             df = df.rename(columns={dias_col: "DIAS DE CONTRATO"})
 
-        # parse de datas e números (igual ao padrão do seu script)
+        # limpa e deriva colunas
         df = parse_mes_col(df, col="MES")
         df["DIAS DE CONTRATO"] = clean_num_series(df["DIAS DE CONTRATO"])
+
+        # normaliza nome do cliente na base mensal
+        df["Cliente_norm"] = df["NOME TRANSPORTADORA(S)"].astype(str).map(normalize_name)
     except Exception as e:
         st.error(f"Erro ao padronizar a base mensal: {e}")
         st.stop()
 
+    # ---------- Padronizar base de visitas ----------
     try:
         visitas = preparar_visitas(dfv)  # Cliente, Cliente_norm, VisitMonth
     except Exception as e:
         st.error(f"Erro na base de visitas: {e}")
         st.stop()
 
-    # Descobrir último mês fechado a partir da base
+    # ---------- Determinar último mês fechado ----------
     if df["MES"].notna().any():
         ultimo_mes_fechado = df["MES"].max().to_period("M").to_timestamp("M")
         current_month_str = ultimo_mes_fechado.strftime("%Y-%m")
@@ -195,14 +249,17 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         st.error("A coluna MES não contém datas válidas.")
         st.stop()
 
-    # Janela dos N últimos meses
-    mesesN = [p.strftime("%Y-%m") for p in pd.period_range(end=pd.Period(current_month_str, freq="M"), periods=meses_janela)]
+    # ---------- Janela de meses N ----------
+    mesesN = [p.strftime("%Y-%m") for p in pd.period_range(end=pd.Period(current_month_str, freq="M"),
+                                                           periods=meses_janela)]
 
-    # Processar por cliente visitado
+    # ---------- Filtrar visitas para clientes existentes na base mensal ----------
+    clientes_base = set(df["Cliente_norm"].unique())
+    visitas = visitas[visitas["Cliente_norm"].isin(clientes_base)].copy()
+
+    # ---------- Processar por cliente ----------
     linhas = []
-    clientes_v = visitas["Cliente_norm"].tolist()
-    df["Cliente_norm"] = df["NOME TRANSPORTADORA(S)"].astype(str).str.strip().str.upper()
-
+    # agrupar mensal por cliente é feito dentro do loop para manter status/último do mês
     for _, rowv in visitas.iterrows():
         cliente_raw = rowv["Cliente"]
         cliente_norm = rowv["Cliente_norm"]
@@ -210,49 +267,32 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
 
         dcli = df[df["Cliente_norm"] == cliente_norm].copy()
         if dcli.empty:
-            # tentativa fuzzy simples: contains
-            dcli = df[df["NOME TRANSPORTADORA(S)"].str.contains(cliente_raw, case=False, na=False)]
-
-        if dcli.empty:
-            # linha vazia se não houver dados
-            linha = {
-                "Cliente": cliente_raw,
-                "Visit Month": visit_month,
-                "Visita: Trimestre": "",
-                "Baseline (visit quarter avg)": np.nan,
-                f"Atual ({current_month_str})": np.nan,
-                "Impacto (dias)": np.nan,
-                "Impacto (%)": np.nan,
-                "Status (visita)": None,
-                f"Status ({current_month_str})": None,
-                f"Média {meses_janela}m": np.nan,
-                "Observação": "Sem dados na base",
-            }
-            for m in mesesN:
-                linha[m] = 0.0
-            linhas.append(linha)
+            # sem match? ignora (não entra no relatório)
             continue
 
         # Agrega por AnoMes
-        agr = dcli.groupby(["AnoMes"], as_index=False).agg(
-            **{
-                "DIAS DE CONTRATO": ("DIAS DE CONTRATO", "sum"),
-                **({"ESTADO": ("ESTADO", "last")} if "ESTADO" in dcli.columns else {})
-            }
-        )
+        agg_dict = {"DIAS DE CONTRATO": ("DIAS DE CONTRATO", "sum")}
+        if "ESTADO" in dcli.columns:
+            agg_dict["ESTADO"] = ("ESTADO", "last")
+
+        agr = dcli.groupby(["AnoMes"], as_index=False).agg(**agg_dict)
+
         # Prepara campos auxiliares para baseline
         agr["Ano"] = pd.to_datetime(agr["AnoMes"]).dt.year
         agr["MesNum"] = pd.to_datetime(agr["AnoMes"]).dt.month
 
-        # Baseline (trimestre da visita) — mesma lógica do seu código
+        # Baseline (trimestre da visita)
         baseline, rot_trim = media_trimestral_visita(agr_mes=agr, visit_month_str=visit_month)
 
         # Status no mês da visita (se existir)
-        status_visit = agr.loc[agr["AnoMes"] == visit_month, "ESTADO"].iloc[0] if ("ESTADO" in agr.columns and visit_month in set(agr["AnoMes"])) else None
+        status_visit = agr.loc[agr["AnoMes"] == visit_month, "ESTADO"].iloc[0] \
+            if ("ESTADO" in agr.columns and visit_month in set(agr["AnoMes"])) else None
 
         # Atual (último mês)
-        current_val = float(agr.loc[agr["AnoMes"] == current_month_str, "DIAS DE CONTRATO"].iloc[0]) if current_month_str in set(agr["AnoMes"]) else np.nan
-        status_current = agr.loc[agr["AnoMes"] == current_month_str, "ESTADO"].iloc[0] if ("ESTADO" in agr.columns and current_month_str in set(agr["AnoMes"])) else None
+        current_val = float(agr.loc[agr["AnoMes"] == current_month_str, "DIAS DE CONTRATO"].iloc[0]) \
+            if current_month_str in set(agr["AnoMes"]) else np.nan
+        status_current = agr.loc[agr["AnoMes"] == current_month_str, "ESTADO"].iloc[0] \
+            if ("ESTADO" in agr.columns and current_month_str in set(agr["AnoMes"])) else None
 
         # Impacto
         impacto_dias, impacto_pct = np.nan, np.nan
@@ -262,12 +302,13 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
                 impacto_pct = impacto_dias / baseline * 100.0
 
         # Série últimos N meses
-        serieN = {m: float(agr.loc[agr["AnoMes"] == m, "DIAS DE CONTRATO"].iloc[0]) if m in set(agr["AnoMes"]) else 0.0 for m in mesesN}
+        serieN = {
+            m: float(agr.loc[agr["AnoMes"] == m, "DIAS DE CONTRATO"].iloc[0]) if m in set(agr["AnoMes"]) else 0.0
+            for m in mesesN
+        }
         mediaN = float(np.mean(list(serieN.values()))) if len(serieN) > 0 else np.nan
 
         obs = ""
-        # Exemplo da sua observação original: visitas de nov/2025 não têm mês completo pós-visita
-        # Mantemos a ideia de avisar se a visita ocorreu no mesmo mês do "Atual"
         if visit_month == current_month_str:
             obs = "Sem mês completo pós-visita (visita no mês do 'Atual')"
 
@@ -287,19 +328,35 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         linha.update(serieN)
         linhas.append(linha)
 
+    # ---------- Monta saídas ----------
+    if len(linhas) == 0:
+        st.warning("Nenhum cliente com visita encontrou correspondência na base mensal após normalização.")
+        st.stop()
+
     resumo = pd.DataFrame(linhas)
 
-    # Pivot mensal para a aba 2 (últimos N meses)
+    # Pivot mensal (para os últimos N meses)
     dfN = df[df["AnoMes"].isin(mesesN)].copy()
-    pivot = dfN.pivot_table(index="NOME TRANSPORTADORA(S)", columns="AnoMes", values="DIAS DE CONTRATO", aggfunc="sum").fillna(0.0).reset_index()
+    pivot = dfN.pivot_table(
+        index="NOME TRANSPORTADORA(S)",
+        columns="AnoMes",
+        values="DIAS DE CONTRATO",
+        aggfunc="sum"
+    ).fillna(0.0).reset_index()
 
-    st.success(f"Relatório gerado. {len(resumo):,} linhas.", icon="✅")
+    st.success(f"Relatório gerado. {len(resumo):,} clientes com match.", icon="✅")
     st.dataframe(resumo, use_container_width=True)
 
     # ===== Downloads =====
     # CSV (Excel-friendly)
     csv_bytes = resumo.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("💾 Baixar CSV (Resumo)", data=csv_bytes, file_name="ROI_PX_Day_Resumo.csv", mime="text/csv", use_container_width=True)
+    st.download_button(
+        "💾 Baixar CSV (Resumo)",
+        data=csv_bytes,
+        file_name="ROI_PX_Day_Resumo.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
     # Excel com duas abas
     xbuf = BytesIO()
@@ -307,4 +364,10 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         resumo.to_excel(wr, sheet_name=f"Resumo ({meses_janela}m)", index=False)
         pivot.to_excel(wr, sheet_name=f"Mensal por Cliente ({meses_janela}m)", index=False)
     xbuf.seek(0)
-    st.download_button("📘 Baixar Excel (2 abas)", data=xbuf.getvalue(), file_name="ROI_PX_Day_relatorio.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.download_button(
+        "📘 Baixar Excel (2 abas)",
+        data=xbuf.getvalue(),
+        file_name="ROI_PX_Day_relatorio.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
